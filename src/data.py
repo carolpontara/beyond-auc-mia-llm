@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from datasets import load_dataset
 
@@ -19,10 +19,38 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
 
 
-def load_real_text_dataset(dataset_name: str, dataset_config: str, text_column: str):
-    dataset = load_dataset(dataset_name, dataset_config)
-    train_texts = [t.strip() for t in dataset["train"][text_column] if t and t.strip()]
-    test_texts = [t.strip() for t in dataset["test"][text_column] if t and t.strip()]
+def load_real_text_dataset(
+    dataset_name: str,
+    dataset_config: Optional[str],
+    text_column: str,
+    max_train: int = 0,
+    max_eval: int = 0,
+) -> Tuple[List[str], List[str]]:
+    """Load a HuggingFace text dataset.
+
+    For datasets without a predefined test split (e.g. OpenWebText) we
+    split the train set 90/10.
+    """
+    if dataset_config:
+        dataset = load_dataset(dataset_name, dataset_config)
+    else:
+        dataset = load_dataset(dataset_name)
+
+    if "test" in dataset:
+        train_texts = [t.strip() for t in dataset["train"][text_column] if t and t.strip()]
+        test_texts = [t.strip() for t in dataset["test"][text_column] if t and t.strip()]
+    else:
+        # datasets like openwebtext have only a train split
+        all_texts = [t.strip() for t in dataset["train"][text_column] if t and t.strip()]
+        split_idx = int(len(all_texts) * 0.9)
+        train_texts = all_texts[:split_idx]
+        test_texts = all_texts[split_idx:]
+
+    if max_train > 0:
+        train_texts = train_texts[:max_train]
+    if max_eval > 0:
+        test_texts = test_texts[:max_eval]
+
     return train_texts, test_texts
 
 
@@ -86,5 +114,3 @@ def truncate_list(values: List[str], max_items: int) -> List[str]:
     if max_items <= 0:
         return values
     return values[: max_items]
-
-

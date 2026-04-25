@@ -5,9 +5,7 @@
     "distilgpt2",
     "gpt2",
     "EleutherAI/pythia-160m",
-    "facebook/opt-125m",
-    "gpt2-medium",
-    "EleutherAI/pythia-410m"
+    "facebook/opt-125m"
   ],
   "datasets": [
     {

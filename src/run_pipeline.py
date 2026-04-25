@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import random
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -470,6 +471,16 @@ def run_single_experiment(
 
     save_json(os.path.join(exp_dir, "metrics_summary.json"), attack_summaries)
     save_json(os.path.join(exp_dir, "run_config.json"), single_cfg)
+
+    # 11. Delete saved model weights to free disk space.
+    # Results (CSVs, JSONs) are already persisted above.
+    dirs_to_delete = [os.path.join(exp_dir, "model")]
+    for si in range(num_shadow):
+        dirs_to_delete.append(os.path.join(exp_dir, f"shadow_{si}"))
+    for d in dirs_to_delete:
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+            print(f"[LOG] Deleted model directory: {d}")
 
     return {
         "model": model_name,

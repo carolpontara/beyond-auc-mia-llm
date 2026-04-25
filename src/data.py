@@ -19,6 +19,19 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
 
 
+def _stream_texts(split, text_column: str, limit: int) -> List[str]:
+    """Collect up to `limit` non-empty texts from a streaming split."""
+    texts: List[str] = []
+    for item in split:
+        raw = item.get(text_column, "") or ""
+        t = raw.strip()
+        if t:
+            texts.append(t)
+        if len(texts) >= limit:
+            break
+    return texts
+
+
 def load_real_text_dataset(
     dataset_name: str,
     dataset_config: Optional[str],
@@ -26,25 +39,35 @@ def load_real_text_dataset(
     max_train: int = 0,
     max_eval: int = 0,
 ) -> Tuple[List[str], List[str]]:
-    """Load a HuggingFace text dataset.
+    """Load a HuggingFace text dataset using streaming.
 
-    For datasets without a predefined test split (e.g. OpenWebText) we
-    split the train set 90/10.
+    Streaming avoids downloading the full dataset into memory — only the
+    texts actually needed (up to max_train + max_eval) are fetched.  This
+    is critical for large datasets such as OpenWebText (~24 GB).
+
+    For datasets without a predefined test split (e.g. OpenWebText) the
+    train stream is split 90/10.
     """
+    load_kwargs: Dict = {"streaming": True}
     if dataset_config:
-        dataset = load_dataset(dataset_name, dataset_config)
-    else:
-        dataset = load_dataset(dataset_name)
+        load_kwargs["name"] = dataset_config
+
+    dataset = load_dataset(dataset_name, **load_kwargs)
+
+    want_train = max_train if max_train > 0 else 10_000
+    want_eval = max_eval if max_eval > 0 else 1_000
 
     if "test" in dataset:
-        train_texts = [t.strip() for t in dataset["train"][text_column] if t and t.strip()]
-        test_texts = [t.strip() for t in dataset["test"][text_column] if t and t.strip()]
+        train_texts = _stream_texts(dataset["train"], text_column, want_train)
+        test_texts = _stream_texts(dataset["test"], text_column, want_eval)
     else:
-        # datasets like openwebtext have only a train split
-        all_texts = [t.strip() for t in dataset["train"][text_column] if t and t.strip()]
-        split_idx = int(len(all_texts) * 0.9)
-        train_texts = all_texts[:split_idx]
-        test_texts = all_texts[split_idx:]
+        # Datasets like OpenWebText have only a train split — stream exactly
+        # want_train + want_eval texts and slice directly.  A proportional
+        # 90/10 split would give only (want_train+want_eval)*0.1 for eval,
+        # which is less than want_eval whenever want_train >> want_eval.
+        all_texts = _stream_texts(dataset["train"], text_column, want_train + want_eval)
+        train_texts = all_texts[:want_train]
+        test_texts = all_texts[want_train:]
 
     if max_train > 0:
         train_texts = train_texts[:max_train]

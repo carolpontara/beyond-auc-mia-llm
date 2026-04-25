@@ -1,13 +1,11 @@
 {
   "seed": 42,
-  "output_dir": "output",
+  "output_dir": "output\\EleutherAI_pythia-160m_wikitext-2-raw-v1_r2",
   "models": [
     "distilgpt2",
     "gpt2",
     "EleutherAI/pythia-160m",
-    "facebook/opt-125m",
-    "gpt2-medium",
-    "EleutherAI/pythia-410m"
+    "facebook/opt-125m"
   ],
   "datasets": [
     {
@@ -30,7 +28,7 @@
   "max_eval_texts": 800,
   "max_length": 128,
   "num_train_epochs": 2,
-  "learning_rate": 5e-5,
+  "learning_rate": 5e-05,
   "train_batch_size": 4,
   "eval_batch_size": 4,
   "gradient_accumulation_steps": 1,
@@ -40,7 +38,7 @@
   "save_total_limit": 1,
   "fp16": false,
   "num_canaries": 25,
-  "canary_repetitions": [1, 2, 4, 8],
+  "canary_repetitions": 2,
   "member_sample_size": 500,
   "nonmember_sample_size": 500,
   "num_attack_runs": 5,
@@ -54,5 +52,9 @@
     "min_k_pp",
     "recall",
     "lira"
-  ]
+  ],
+  "model_name": "EleutherAI/pythia-160m",
+  "dataset_name": "wikitext",
+  "dataset_config": "wikitext-2-raw-v1",
+  "text_column": "text"
 }

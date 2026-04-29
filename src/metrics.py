@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Dict, List, Sequence, Set, Tuple
+import warnings
 
 import numpy as np
 from scipy import stats as scipy_stats
@@ -10,6 +11,9 @@ from sklearn.metrics import (
     roc_curve,
 )
 
+# Suppress scipy warnings about NaN in distribution calculations
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="scipy.stats._distn_infrastructure")
+
 
 # ---------------------------------------------------------------------------
 # Thresholding strategies
@@ -17,9 +21,11 @@ from sklearn.metrics import (
 
 def default_threshold(scores: Sequence[float], smaller_is_member: bool) -> float:
     values = np.array(list(scores), dtype=float)
-    if len(values) == 0:
+    # Filter out NaN and inf values
+    valid_values = values[np.isfinite(values)]
+    if len(valid_values) == 0:
         return 0.0
-    return float(np.median(values))
+    return float(np.median(valid_values))
 
 
 def best_f1_threshold(
@@ -30,7 +36,11 @@ def best_f1_threshold(
 ) -> float:
     """Sweep thresholds and return the one that maximises F1."""
     arr = np.array(list(scores), dtype=float)
-    lo, hi = float(arr.min()), float(arr.max())
+    # Filter out NaN and inf values
+    valid_arr = arr[np.isfinite(arr)]
+    if len(valid_arr) == 0:
+        return 0.0
+    lo, hi = float(valid_arr.min()), float(valid_arr.max())
     if lo == hi:
         return lo
     best_t, best_f1 = lo, 0.0
@@ -67,17 +77,30 @@ def tpr_at_fpr(
     """Compute TPR at specified FPR thresholds using the ROC curve."""
     labels_arr = np.array(list(labels))
     scores_arr = np.array(list(scores), dtype=float)
+    
+    # Filter out NaN and inf values
+    valid_mask = np.isfinite(scores_arr)
+    if not np.any(valid_mask):
+        return {f"tpr@fpr={fpr:.2f}": float("nan") for fpr in target_fprs}
+    
+    labels_arr = labels_arr[valid_mask]
+    scores_arr = scores_arr[valid_mask]
+    
     if smaller_is_member:
         scores_arr = -scores_arr
     if len(set(labels_arr.tolist())) < 2:
         return {f"tpr@fpr={fpr:.2f}": float("nan") for fpr in target_fprs}
-    fpr_vals, tpr_vals, _ = roc_curve(labels_arr, scores_arr)
-    result: Dict[str, float] = {}
-    for target in target_fprs:
-        idx = np.searchsorted(fpr_vals, target, side="right") - 1
-        idx = max(0, min(idx, len(tpr_vals) - 1))
-        result[f"tpr@fpr={target:.2f}"] = float(tpr_vals[idx])
-    return result
+    
+    try:
+        fpr_vals, tpr_vals, _ = roc_curve(labels_arr, scores_arr)
+        result: Dict[str, float] = {}
+        for target in target_fprs:
+            idx = np.searchsorted(fpr_vals, target, side="right") - 1
+            idx = max(0, min(idx, len(tpr_vals) - 1))
+            result[f"tpr@fpr={target:.2f}"] = float(tpr_vals[idx])
+        return result
+    except Exception:
+        return {f"tpr@fpr={fpr:.2f}": float("nan") for fpr in target_fprs}
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +114,16 @@ def classification_metrics(
 ) -> Dict[str, float]:
     labels_list = list(labels)
     scores_list = list(scores)
+    
+    # Filter out NaN and inf values
+    valid_indices = [
+        i for i, s in enumerate(scores_list)
+        if not (np.isnan(s) or np.isinf(s))
+    ]
+    if valid_indices:
+        labels_list = [labels_list[i] for i in valid_indices]
+        scores_list = [scores_list[i] for i in valid_indices]
+    
     if len(set(labels_list)) < 2:
         auc = float("nan")
     else:
@@ -189,15 +222,38 @@ def aggregate_run_metrics(
     keys = [k for k in run_metrics[0] if isinstance(run_metrics[0][k], (int, float))]
     agg: Dict[str, Dict[str, float]] = {}
     for key in keys:
-        vals = np.array([m[key] for m in run_metrics if not np.isnan(m.get(key, float("nan")))], dtype=float)
+        # Filter out NaN and inf values
+        vals = np.array([
+            m[key] for m in run_metrics 
+            if np.isfinite(m.get(key, float("nan")))
+        ], dtype=float)
+        
         if len(vals) == 0:
             agg[key] = {"mean": float("nan"), "std": float("nan"), "ci_low": float("nan"), "ci_high": float("nan")}
             continue
         mean = float(np.mean(vals))
         std = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+        
+        # Safeguard against NaN/inf in mean or std
+        if not (np.isfinite(mean) and np.isfinite(std)):
+            agg[key] = {"mean": mean, "std": std, "ci_low": mean, "ci_high": mean}
+            continue
+        
         if len(vals) > 1:
-            ci = scipy_stats.t.interval(confidence, df=len(vals) - 1, loc=mean, scale=std / np.sqrt(len(vals)))
-            ci_low, ci_high = float(ci[0]), float(ci[1])
+            try:
+                scale = std / np.sqrt(len(vals))
+                if not np.isfinite(scale) or scale < 0:
+                    ci_low, ci_high = mean, mean
+                else:
+                    ci = scipy_stats.t.interval(confidence, df=len(vals) - 1, loc=mean, scale=scale)
+                    ci_low, ci_high = float(ci[0]), float(ci[1])
+                    # Ensure ci values are finite
+                    if not np.isfinite(ci_low):
+                        ci_low = mean
+                    if not np.isfinite(ci_high):
+                        ci_high = mean
+            except Exception:
+                ci_low, ci_high = mean, mean
         else:
             ci_low, ci_high = mean, mean
         agg[key] = {"mean": mean, "std": std, "ci_low": ci_low, "ci_high": ci_high}

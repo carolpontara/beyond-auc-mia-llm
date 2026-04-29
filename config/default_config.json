@@ -27,8 +27,7 @@
   "max_train_texts": 4000,
   "max_eval_texts": 800,
   "max_length": 128,
-  "block_size": 128,
-  "num_train_epochs": 1,
+  "num_train_epochs": 2,
   "learning_rate": 5e-5,
   "train_batch_size": 4,
   "eval_batch_size": 4,
@@ -43,7 +42,7 @@
   "member_sample_size": 500,
   "nonmember_sample_size": 500,
   "num_attack_runs": 5,
-  "num_shadow_models": 2,
+  "num_shadow_models": 4,
   "neighborhood_variants": 3,
   "min_k_ratio": 0.2,
   "attacks": [
@@ -53,9 +52,5 @@
     "min_k_pp",
     "recall",
     "lira"
-  ],
-  "model_name": "distilgpt2",
-  "dataset_name": "wikitext",
-  "dataset_config": "wikitext-2-raw-v1",
-  "text_column": "text"
+  ]
 }

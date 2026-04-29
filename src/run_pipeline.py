@@ -5,6 +5,8 @@ import copy
 import json
 import os
 import random
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -13,7 +15,7 @@ import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from attacks import compute_attack_scores, sequence_loss
+from attacks import batch_sequence_loss, compute_attack_scores, sequence_loss
 from analysis import compute_sample_features
 from data import (
     CandidateSample,
@@ -40,9 +42,14 @@ ATTACK_SMALLER_IS_MEMBER: Dict[str, bool] = {
     "ref_gap": True,
     "min_k": True,
     "min_k_pp": True,
-    "recall": False,
+    "recall": True,
     "lira": False,
 }
+
+# Attacks whose scores are independent of rng_seed (no randomness in scoring).
+# We compute them once per experiment and replicate across runs, saving
+# (num_attack_runs - 1) full GPU scoring passes.
+DETERMINISTIC_ATTACKS: frozenset = frozenset({"loss", "ref_gap", "min_k_pp", "recall", "lira"})
 
 
 def read_config(path: str) -> Dict[str, Any]:
@@ -85,6 +92,120 @@ def dataset_key(ds_cfg: Dict[str, Any]) -> str:
     """Create a short human-readable key for a dataset config."""
     cfg = ds_cfg.get("dataset_config") or ds_cfg["dataset_name"]
     return str(cfg).replace("/", "_")
+
+
+# ------------------------------------------------------------------
+# Checkpoint/resume helpers
+# ------------------------------------------------------------------
+
+def experiment_exists(exp_dir: str) -> bool:
+    """Check if experiment has been completed."""
+    required_files = [
+        os.path.join(exp_dir, "attack_scores.csv"),
+        os.path.join(exp_dir, "metrics_summary.json"),
+    ]
+    return all(os.path.exists(f) for f in required_files)
+
+
+def load_existing_experiment(exp_dir: str, model_name: str, ds_label: str, canary_rep: int) -> Optional[Dict[str, Any]]:
+    """Load results from an already-completed experiment."""
+    try:
+        # Load attack scores
+        scores_csv = os.path.join(exp_dir, "attack_scores.csv")
+        df_scores = pd.read_csv(scores_csv)
+        
+        # Load metrics
+        metrics_json = os.path.join(exp_dir, "metrics_summary.json")
+        with open(metrics_json, "r", encoding="utf-8") as f:
+            metrics = json.load(f)
+        
+        # Load analysis if it exists
+        analysis_csv = os.path.join(exp_dir, "sample_analysis.csv")
+        df_analysis = pd.read_csv(analysis_csv) if os.path.exists(analysis_csv) else pd.DataFrame()
+        
+        # Reconstruct attack stability info (estimate from metrics)
+        stability_dict = {}
+        for attack_name in metrics.keys():
+            stability_dict[attack_name] = metrics[attack_name].get("stability", {})
+        
+        return {
+            "model": model_name,
+            "dataset": ds_label,
+            "canary_rep": canary_rep,
+            "metrics": metrics,
+            "stability": stability_dict,
+            "scores_df": df_scores,
+            "analysis_df": df_analysis,
+        }
+    except Exception as e:
+        print(f"[WARN] Failed to load existing experiment from {exp_dir}: {e}")
+        return None
+
+
+# ------------------------------------------------------------------
+# Parallel attack execution helpers
+# ------------------------------------------------------------------
+
+def _run_attack_iteration(
+    run_idx: int,
+    attack_name: str,
+    target_model: Any,
+    ref_model: Any,
+    tokenizer: Any,
+    texts: List[str],
+    labels: List[int],
+    candidates: List[Any],
+    sample_ids: List[str],
+    sources: List[str],
+    config: Dict[str, Any],
+    seed: int,
+    smaller_is_member: bool,
+    shadow_models: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    """Run a single attack iteration (one run)."""
+    current_seed = seed + run_idx
+    print(f"[DEBUG] Starting attack '{attack_name}' run {run_idx + 1}/{config['num_attack_runs']}, seed={current_seed}")
+    
+    scores = compute_attack_scores(
+        attack_name=attack_name,
+        target_model=target_model,
+        ref_model=ref_model,
+        tokenizer=tokenizer,
+        texts=texts,
+        max_length=config["max_length"],
+        min_k_ratio=config["min_k_ratio"],
+        rng_seed=current_seed,
+        neighborhood_variants=config["neighborhood_variants"],
+        shadow_models=shadow_models,
+    )
+    metrics = classification_metrics(labels, scores, smaller_is_member)
+    preds = predictions_from_scores(scores, metrics["threshold"], smaller_is_member)
+    metrics["coverage_all_members"] = coverage(sample_ids, labels, preds)
+    metrics["coverage_canaries"] = coverage_canaries(sample_ids, sources, preds)
+    
+    rows = []
+    for ci, (cand, sc, pr) in enumerate(zip(candidates, scores, preds)):
+        rows.append({
+            "model_name": None,  # Will be filled later
+            "dataset": None,  # Will be filled later
+            "canary_rep": None,  # Will be filled later
+            "attack": attack_name,
+            "run": run_idx,
+            "sample_id": cand.sample_id,
+            "source": cand.source,
+            "label": cand.label,
+            "prediction": pr,
+            "score": sc,
+            "text": cand.text[:200],
+        })
+    
+    return {
+        "run_idx": run_idx,
+        "scores": scores,
+        "metrics": metrics,
+        "preds": preds,
+        "rows": rows,
+    }
 
 
 # ------------------------------------------------------------------
@@ -176,8 +297,17 @@ def run_single_experiment(
             shadow_cfg["seed"] = seed + 1000 + si
             shadow_cfg["output_dir"] = os.path.join(exp_dir, f"shadow_{si}")
             ensure_dir(shadow_cfg["output_dir"])
+            # Halve epochs for shadow models: same total compute but doubles
+            # the number of shadow models you can afford, improving z-score quality.
+            shadow_cfg["num_train_epochs"] = max(1, config["num_train_epochs"] // 2)
             rng = random.Random(shadow_cfg["seed"])
-            shadow_train = rng.sample(train_texts, k=min(len(train_texts), config["max_train_texts"]))
+            # Use 50% of train_texts per shadow model so each sample has
+            # ~50% probability of being "out" — this is required for the
+            # LiRA z-score to have a meaningful signal on regular members.
+            # Training on the full set makes target_loss ≈ shadow_loss for
+            # all members, collapsing all z-scores to zero.
+            shadow_size = max(len(train_texts) // 2, 1)
+            shadow_train = rng.sample(train_texts, k=min(shadow_size, len(train_texts)))
             _, shadow_m = train_model(
                 config=shadow_cfg,
                 train_texts=shadow_train,
@@ -187,57 +317,95 @@ def run_single_experiment(
             shadow_models.append(shadow_m)
 
     # 7. Run attacks
+    # Deterministic attacks (loss, ref_gap, min_k_pp, recall, lira) produce
+    # identical scores regardless of rng_seed, so we compute them once and
+    # replicate across runs.  Only min_k varies (uses rng for perturbations).
     all_rows: List[Dict] = []
     attack_summaries: Dict[str, Dict] = {}
     attack_stability: Dict[str, float] = {}
+    # Cache run-0 scores per attack; reused in the analysis step.
+    first_run_scores: Dict[str, List[float]] = {}
 
     for attack_name in config["attacks"]:
         smaller = ATTACK_SMALLER_IS_MEMBER.get(attack_name, True)
         print(f"[LOG]   Attack: {attack_name} (smaller_is_member={smaller})")
+
         run_predictions: List[List[int]] = []
         run_metrics_list: List[Dict[str, float]] = []
 
-        for run_idx in range(config["num_attack_runs"]):
-            scores = compute_attack_scores(
+        if attack_name in DETERMINISTIC_ATTACKS:
+            # Compute once — all runs are identical for deterministic attacks.
+            result = _run_attack_iteration(
+                run_idx=0,
                 attack_name=attack_name,
                 target_model=trained_model,
                 ref_model=ref_model,
                 tokenizer=tokenizer,
                 texts=texts,
-                max_length=config["max_length"],
-                min_k_ratio=config["min_k_ratio"],
-                rng_seed=seed + run_idx,
-                neighborhood_variants=config["neighborhood_variants"],
+                labels=labels,
+                candidates=candidates,
+                sample_ids=sample_ids,
+                sources=sources,
+                config=config,
+                seed=seed,
+                smaller_is_member=smaller,
                 shadow_models=shadow_models if attack_name == "lira" else None,
             )
-            metrics = classification_metrics(labels, scores, smaller)
-            preds = predictions_from_scores(scores, metrics["threshold"], smaller)
-            run_predictions.append(preds)
-            metrics["coverage_all_members"] = coverage(sample_ids, labels, preds)
-            metrics["coverage_canaries"] = coverage_canaries(sample_ids, sources, preds)
-            run_metrics_list.append(metrics)
-
-            for ci, (cand, sc, pr) in enumerate(zip(candidates, scores, preds)):
-                all_rows.append({
-                    "model": model_name,
-                    "dataset": ds_label,
-                    "canary_rep": canary_rep,
-                    "attack": attack_name,
-                    "run": run_idx,
-                    "sample_id": cand.sample_id,
-                    "source": cand.source,
-                    "label": cand.label,
-                    "prediction": pr,
-                    "score": sc,
-                    "text": cand.text[:200],
-                })
-
+            first_run_scores[attack_name] = result["scores"]
+            for run_idx in range(config["num_attack_runs"]):
+                run_predictions.append(result["preds"])
+                run_metrics_list.append(result["metrics"])
+                for row in result["rows"]:
+                    all_rows.append({
+                        **row,
+                        "run": run_idx,
+                        "model": model_name,
+                        "dataset": ds_label,
+                        "canary_rep": canary_rep,
+                    })
             print(
-                f"[LOG]     run {run_idx + 1}: "
-                f"AUC={metrics['auc']:.3f} F1={metrics['f1']:.3f} "
-                f"F1_best={metrics['f1_f1']:.3f} "
-                f"canary_cov={metrics['coverage_canaries']:.3f}"
+                f"[LOG]     (×{config['num_attack_runs']} runs, deterministic) "
+                f"AUC={result['metrics']['auc']:.3f} F1={result['metrics']['f1']:.3f} "
+                f"F1_best={result['metrics']['f1_f1']:.3f} "
+                f"canary_cov={result['metrics']['coverage_canaries']:.3f}"
             )
+        else:
+            # Non-deterministic (min_k): run sequentially.
+            # Batched GPU inference already maximises device utilisation.
+            for run_idx in range(config["num_attack_runs"]):
+                result = _run_attack_iteration(
+                    run_idx=run_idx,
+                    attack_name=attack_name,
+                    target_model=trained_model,
+                    ref_model=ref_model,
+                    tokenizer=tokenizer,
+                    texts=texts,
+                    labels=labels,
+                    candidates=candidates,
+                    sample_ids=sample_ids,
+                    sources=sources,
+                    config=config,
+                    seed=seed,
+                    smaller_is_member=smaller,
+                    shadow_models=None,
+                )
+                if run_idx == 0:
+                    first_run_scores[attack_name] = result["scores"]
+                run_predictions.append(result["preds"])
+                run_metrics_list.append(result["metrics"])
+                for row in result["rows"]:
+                    all_rows.append({
+                        **row,
+                        "model": model_name,
+                        "dataset": ds_label,
+                        "canary_rep": canary_rep,
+                    })
+                print(
+                    f"[LOG]     run {run_idx + 1}: "
+                    f"AUC={result['metrics']['auc']:.3f} F1={result['metrics']['f1']:.3f} "
+                    f"F1_best={result['metrics']['f1_f1']:.3f} "
+                    f"canary_cov={result['metrics']['coverage_canaries']:.3f}"
+                )
 
         stab = stability(run_predictions, sample_ids)
         attack_stability[attack_name] = stab
@@ -245,28 +413,16 @@ def run_single_experiment(
         attack_summaries[attack_name] = agg
         attack_summaries[attack_name]["stability"] = stab
 
-    # 8. Sample vulnerability analysis (first run, first attack with loss)
+    # 8. Sample vulnerability analysis
+    # Reuse cached run-0 scores — no GPU re-computation needed.
+    # compute_sample_features is CPU-only so ThreadPoolExecutor gives real parallelism.
     analysis_frames: List[pd.DataFrame] = []
-    target_losses = [
-        sequence_loss(trained_model, tokenizer, t, config["max_length"]) for t in texts
-    ]
-    ref_losses = [
-        sequence_loss(ref_model, tokenizer, t, config["max_length"]) for t in texts
-    ]
-    for attack_name in config["attacks"]:
+    target_losses = batch_sequence_loss(trained_model, tokenizer, texts, config["max_length"])
+    ref_losses = batch_sequence_loss(ref_model, tokenizer, texts, config["max_length"])
+
+    def _compute_analysis_for_attack(attack_name: str) -> pd.DataFrame:
         smaller = ATTACK_SMALLER_IS_MEMBER.get(attack_name, True)
-        scores = compute_attack_scores(
-            attack_name=attack_name,
-            target_model=trained_model,
-            ref_model=ref_model,
-            tokenizer=tokenizer,
-            texts=texts,
-            max_length=config["max_length"],
-            min_k_ratio=config["min_k_ratio"],
-            rng_seed=seed,
-            neighborhood_variants=config["neighborhood_variants"],
-            shadow_models=shadow_models if attack_name == "lira" else None,
-        )
+        scores = first_run_scores[attack_name]
         metrics = classification_metrics(labels, scores, smaller)
         preds = predictions_from_scores(scores, metrics["threshold"], smaller)
         df_feat = compute_sample_features(
@@ -284,7 +440,18 @@ def run_single_experiment(
         df_feat["model"] = model_name
         df_feat["dataset"] = ds_label
         df_feat["canary_rep"] = canary_rep
-        analysis_frames.append(df_feat)
+        return df_feat
+
+    with ThreadPoolExecutor(max_workers=min(len(config["attacks"]), os.cpu_count() or 4)) as executor:
+        futures = {executor.submit(_compute_analysis_for_attack, atk): atk for atk in config["attacks"]}
+        for future in as_completed(futures):
+            try:
+                df = future.result()
+                analysis_frames.append(df)
+            except Exception as e:
+                atk = futures[future]
+                print(f"[ERROR] Analysis for attack {atk} failed: {e}")
+                raise
 
     # 9. Clean up GPU memory
     del trained_model, ref_model
@@ -304,6 +471,16 @@ def run_single_experiment(
 
     save_json(os.path.join(exp_dir, "metrics_summary.json"), attack_summaries)
     save_json(os.path.join(exp_dir, "run_config.json"), single_cfg)
+
+    # 11. Delete saved model weights to free disk space.
+    # Results (CSVs, JSONs) are already persisted above.
+    dirs_to_delete = [os.path.join(exp_dir, "model")]
+    for si in range(num_shadow):
+        dirs_to_delete.append(os.path.join(exp_dir, f"shadow_{si}"))
+    for d in dirs_to_delete:
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+            print(f"[LOG] Deleted model directory: {d}")
 
     return {
         "model": model_name,
@@ -351,12 +528,33 @@ def main(config_path: str) -> None:
 
     total = len(models) * len(datasets) * len(canary_reps)
     idx = 0
+    skipped = 0
     for model_name in models:
         for ds_cfg in datasets:
             for crep in canary_reps:
                 idx += 1
+                ds_label = dataset_key(ds_cfg)
+                exp_dir = os.path.join(output_base, f"{model_name.replace('/', '_')}_{ds_label}_r{crep}")
+                
                 print(f"\n[LOG] ====== Experiment {idx}/{total} ======")
-                print(f"[LOG]   model={model_name}  dataset={dataset_key(ds_cfg)}  r={crep}")
+                print(f"[LOG]   model={model_name}  dataset={ds_label}  r={crep}")
+                
+                # Check if experiment already exists
+                if experiment_exists(exp_dir):
+                    print(f"[LOG]   ✓ Experiment already completed, loading results...")
+                    result = load_existing_experiment(exp_dir, model_name, ds_label, crep)
+                    if result:
+                        skipped += 1
+                        all_results.append(result)
+                        all_scores_frames.append(result["scores_df"])
+                        if not result["analysis_df"].empty:
+                            all_analysis_frames.append(result["analysis_df"])
+                        print(f"[LOG]   Results loaded successfully")
+                        continue
+                    else:
+                        print(f"[LOG]   ! Failed to load results, re-running experiment")
+                
+                # Run new experiment
                 result = run_single_experiment(
                     model_name=model_name,
                     ds_cfg=ds_cfg,
@@ -369,6 +567,8 @@ def main(config_path: str) -> None:
                 all_scores_frames.append(result["scores_df"])
                 if not result["analysis_df"].empty:
                     all_analysis_frames.append(result["analysis_df"])
+    
+    print(f"\n[LOG] Experiments completed: {idx - skipped} new, {skipped} loaded from checkpoint")
 
     # ------------------------------------------------------------------
     # Aggregate into full_summary.json

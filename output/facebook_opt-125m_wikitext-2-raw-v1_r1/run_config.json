@@ -1,0 +1,60 @@
+{
+  "seed": 42,
+  "output_dir": "output\\facebook_opt-125m_wikitext-2-raw-v1_r1",
+  "models": [
+    "distilgpt2",
+    "gpt2",
+    "EleutherAI/pythia-160m",
+    "facebook/opt-125m"
+  ],
+  "datasets": [
+    {
+      "dataset_name": "wikitext",
+      "dataset_config": "wikitext-2-raw-v1",
+      "text_column": "text"
+    },
+    {
+      "dataset_name": "wikitext",
+      "dataset_config": "wikitext-103-raw-v1",
+      "text_column": "text"
+    },
+    {
+      "dataset_name": "openwebtext",
+      "dataset_config": null,
+      "text_column": "text"
+    }
+  ],
+  "max_train_texts": 4000,
+  "max_eval_texts": 800,
+  "max_length": 128,
+  "num_train_epochs": 2,
+  "learning_rate": 5e-05,
+  "train_batch_size": 4,
+  "eval_batch_size": 4,
+  "gradient_accumulation_steps": 1,
+  "warmup_ratio": 0.03,
+  "weight_decay": 0.01,
+  "logging_steps": 50,
+  "save_total_limit": 1,
+  "fp16": false,
+  "num_canaries": 25,
+  "canary_repetitions": 1,
+  "member_sample_size": 500,
+  "nonmember_sample_size": 500,
+  "num_attack_runs": 5,
+  "num_shadow_models": 4,
+  "neighborhood_variants": 3,
+  "min_k_ratio": 0.2,
+  "attacks": [
+    "loss",
+    "ref_gap",
+    "min_k",
+    "min_k_pp",
+    "recall",
+    "lira"
+  ],
+  "model_name": "facebook/opt-125m",
+  "dataset_name": "wikitext",
+  "dataset_config": "wikitext-2-raw-v1",
+  "text_column": "text"
+}
